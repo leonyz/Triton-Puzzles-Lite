@@ -58,16 +58,18 @@ tl.load use mask: [0 1 2 3 4 5 6 7] < 5 = [1 1 1 1 1 0 0 0]
 
 @triton.jit
 def demo1(x_ptr):
-    range = tl.arange(0, 8)
+    range = tl.arange(0, 16)
     # print works in the interpreter
     print(range)
-    x = tl.load(x_ptr + range, range < 5, 0)
+    print(x_ptr)
+    print(x_ptr + range)
+    x = tl.load(x_ptr + range, range < 11, 0)
     print(x)
 
 
 def run_demo1():
     print("Demo1 Output: ")
-    demo1[(1, 1, 1)](torch.ones(4, 3))
+    demo1[(1, 1, 1)](torch.arange(12).reshape(4, 3))
     print_end_line()
 
 
@@ -214,8 +216,8 @@ def add_spec(x: Float32[32,]) -> Float32[32,]:
 def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # We name the offsets of the pointers as "off_"
     off_x = tl.arange(0, B0)
-    x = tl.load(x_ptr + off_x)
-    # Finish me!
+    x = tl.load(x_ptr + off_x, off_x < B0)
+    z = tl.store(z_ptr + off_x, x + 10, off_x < B0)
     return
 
 
@@ -236,7 +238,11 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
-    # Finish me!
+    # we get the block ids in Triton with tl.program_id(0), tl.program_id(1), etc.
+    block_id = tl.program_id(0)
+    off_x = tl.arange(0, B0) + B0 * block_id
+    x = tl.load(x_ptr + off_x, off_x < N0)
+    z = tl.store(z_ptr + off_x, x + 10, off_x < N0)
     return
 
 
@@ -259,7 +265,14 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
+    off_x = tl.arange(0, B0)[None, :]
+    x = tl.load(x_ptr + off_x, off_x < N0)
+    off_y = tl.arange(0, B1)[:, None]
+    y = tl.load(y_ptr + off_y, off_y < N1)
+
+    off_z = tl.arange(0, B0*B1).reshape(B0, B1)
+    tl.store(z_ptr + off_z, x + y, off_z < N0*N1)
+
     return
 
 
@@ -286,10 +299,27 @@ def add_vec_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
-    # Finish me!
+
+    # offsets for x and y are just block_id_x * B0 and block_id_y * B1
+    off_x = tl.arange(0, B0)[None, :] + block_id_x*B0
+    x = tl.load(x_ptr + off_x, off_x < N0)
+    off_y = tl.arange(0, B1)[:, None] + block_id_y*B1
+    y = tl.load(y_ptr + off_y, off_y < N1)
+
+    # shift off_z to the right starting point
+    # x_offset for z: block_id_x * B0
+    # y offset for z: block_id_y * B1 * N0
+    off_z_x = tl.arange(0, B0)[None, :] + block_id_x * B0
+    off_z_y = N0 * tl.arange(0, B1)[:, None] + block_id_y * B1 * N0
+    off_z = off_z_x + off_z_y
+    off_z = off_z
+
+    # constructing the mask is a little tricky. we want off_z_x and off_z_y to remain inbounds
+    # the bound is N0 for off_z_x and N0*N1 for off_z_y
+    mask = (off_z_x < N0) * (off_z_y < N0*N1)
+    mask = mask
+    tl.store(z_ptr + off_z, x + y, mask)
     return
-
-
 r"""
 ## Puzzle 5: Fused Outer Multiplication
 
@@ -313,7 +343,21 @@ def mul_relu_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
-    # Finish me!
+    off_x = tl.arange(0, B0)[None, :] + block_id_x * B0
+    off_y = tl.arange(0, B1)[:, None] + block_id_y * B1
+    x = tl.load(x_ptr + off_x, off_x < N0)
+    y = tl.load(y_ptr + off_y, off_y < N1)
+
+    off_z_x = tl.arange(0, B0)[None, :] + block_id_x * B0
+    off_z_y = tl.arange(0, B1)[:, None] * N0 + block_id_y * B1 * N0
+    off_z = off_z_x + off_z_y
+    off_z = off_z
+
+    # tl.maximum, NOT tl.max
+    z = tl.maximum(x * y, 0)
+    mask = (off_z_x < N0) * (off_z_y < N0 * N1)
+    mask = mask
+    tl.store(z_ptr + off_z, z, mask)
     return
 
 
@@ -353,7 +397,23 @@ def mul_relu_block_back_kernel(
 ):
     block_id_i = tl.program_id(0)
     block_id_j = tl.program_id(1)
-    # Finish me!
+
+    y_off = tl.arange(0, B1) + block_id_j * B1
+    y = tl.load(y_ptr + y_off, y_off < N1)
+
+    x_off_i = tl.arange(0, B0)[None, :] + block_id_i * B0
+    x_off_j = tl.arange(0, B1)[:, None] * N0 + block_id_j * B1 * N0
+    x_off = x_off_i + x_off_j
+    mask = (x_off_i < N0) * (x_off_j < N0*N1)
+    x = tl.load(x_ptr + x_off, mask)
+    z = x * y[:, None]
+
+    dz = tl.load(dz_ptr + x_off, mask)
+    # chain rule: 
+    #  * dx of relu is 1 or 0 depending on whether z is positive
+    #  * dx of x * y is y
+    dx = tl.where(z > 0, dz*y[:,None], 0)
+    tl.store(dx_ptr + x_off, dx, mask)
     return
 
 
@@ -362,7 +422,7 @@ r"""
 
 Sum of a batch of numbers.
 
-Uses one program blocks. Block size `B0` represents a range of batches of  `x` of length `N0`.
+Uses one program block. Block size `B0` represents a range of batches of  `x` of length `N0`.
 Each element is of length `T`. Process it `B1 < T` elements at a time.  
 
 .. math::
@@ -378,7 +438,22 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
-    # Finish me!
+    # this puzzle is a little confusing because we have two block axes but we don't actually use block_id_1
+    # instead we only use block_id_1 to iterate through the entries of x
+    block_id_0 = tl.program_id(0)
+    block_id_1 = tl.program_id(1)
+
+    z = tl.zeros([B0], dtype=tl.float32)
+    for i in range(T // N1 + 1):
+        x_off_0 = tl.arange(0, B0)[:,] + B0 * block_id_0 * T
+        x_off_1 = tl.arange(0, B1)[None, :] + B1 * i
+        x_off = x_off_0 + x_off_1
+        mask = (x_off_1 < T) * (x_off_0 < N0 * T)
+        x = tl.load(x_ptr + x_off, mask)
+        z = z + x.sum(1)
+
+    z_off = tl.arange(0, B0) + B0 * block_id_0
+    tl.store(z_ptr + z_off, z, z_off < N0)
     return
 
 
@@ -413,25 +488,74 @@ def softmax_spec(x: Float32[4, 200]) -> Float32[4, 200]:
     x_exp = x.exp()
     return x_exp / x_exp.sum(1, keepdim=True)
 
-
-@triton.jit
-def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
-    """2 loops ver."""
-    block_id_i = tl.program_id(0)
-    log2_e = 1.44269504
-    # Finish me!
-    return
-
-
 @triton.jit
 def softmax_kernel_brute_force(
     x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr
 ):
     """3 loops ver."""
+    print("three loop version")
+    # one loop to get the x_max
+    # one loop to do the exp sum after subtracting out x_max
+    # one loop to compute exp(x_i - x_max) / exp sum
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
-    # Finish me!
+    x_off_0 = tl.arange(0, B0)[None, :] + block_id_i * B0 * T
+    x_max = tl.load(x_ptr + x_off_0, x_off_0 < T * N0)
+    for i in range(T // N1 + 1):
+        x_off_i = tl.arange(0, B1)[:, None] + B1 * i
+        x_off = x_off_0 + x_off_i
+        mask = (x_off_0 < T * N0) * (x_off_i < T)
+        x = tl.load(x_ptr + x_off, mask)
+        x_max = tl.maximum(x_max, tl.max(x))
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    for i in range(T // N1 + 1):
+        x_off_i = tl.arange(0, B1)[:, None] + B1 * i
+        x_off = x_off_0 + x_off_i
+        mask = (x_off_0 < T * N0) * (x_off_i < T)
+        x = tl.load(x_ptr + x_off, mask)
+        exp_sum = exp_sum + tl.sum(tl.exp2(log2_e * (x - x_max)))
+    for i in range(T // N1 + 1):
+        x_off_i = tl.arange(0, B1)[:, None] + B1 * i
+        x_off = x_off_0 + x_off_i
+        mask = (x_off_0 < T * N0) * (x_off_i < T)
+        x = tl.load(x_ptr + x_off, mask)
+        softmax_x = tl.exp2(log2_e * (x - x_max)) / exp_sum
+        tl.store(z_ptr + x_off, softmax_x, mask)
     return
+
+
+@triton.jit
+def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
+    """2 loops ver."""
+    # one loop to compute the x_max and exp sum
+    # we'll keep a running x_max and exp_sum. we need to scale exp_sum accordingly by dividing
+    # the old exp_sum by e^{new_x_max - old_x_max}
+    # one loop to compute exp(x_i - x_max) / exp sum
+    print("two loop version")
+    block_id_i = tl.program_id(0)
+    log2_e = 1.44269504
+    x_off_0 = tl.arange(0, B0)[None, :] + block_id_i * B0 * T
+    x_max = tl.load(x_ptr + x_off_0, x_off_0 < T * N0)
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    for i in range(T // N1 + 1):
+        x_off_i = tl.arange(0, B1)[:, None] + B1 * i
+        x_off = x_off_0 + x_off_i
+        mask = (x_off_0 < T * N0) * (x_off_i < T)
+        x = tl.load(x_ptr + x_off, mask)
+        new_x_max = tl.maximum(x_max, tl.max(x))
+        exp_sum = exp_sum / tl.exp2(log2_e  * (new_x_max - x_max))
+        x_max = new_x_max
+        exp_sum = exp_sum + tl.sum(tl.exp2(log2_e * (x - x_max)))
+    for i in range(T // N1 + 1):
+        x_off_i = tl.arange(0, B1)[:, None] + B1 * i
+        x_off = x_off_0 + x_off_i
+        mask = (x_off_0 < T * N0) * (x_off_i < T)
+        x = tl.load(x_ptr + x_off, mask)
+        softmax_x = tl.exp2(log2_e * (x - x_max)) / exp_sum
+        tl.store(z_ptr + x_off, softmax_x, mask)
+    return
+
+
 
 
 r"""
@@ -439,7 +563,7 @@ r"""
 
 A scalar version of FlashAttention.
 
-Uses zero programs. Block size `B0` represent the batches of `q` to process out of `N0`. Sequence length is `T`. Process it `B1 < T` elements (`k`, `v`) at a time for some `B1`.
+Uses one program. Block size `B0` represent the batches of `q` to process out of `N0`. Sequence length is `T`. Process it `B1 < T` elements (`k`, `v`) at a time for some `B1`.
 
 .. math::
     z_{i} = \sum_{j=1}^{T} \text{softmax}(q_i k_1, \ldots, q_i k_T)_j v_{j} \text{ for } i = 1\ldots N_0
@@ -468,7 +592,41 @@ def flashatt_kernel(
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     myexp = lambda x: tl.exp2(log2_e * x)
-    # Finish me!
+
+    q_off = tl.arange(0, B0)[:, None] + block_id_i * B0
+    q = tl.load(q_ptr + q_off, q_off < N0)
+
+    x_max = tl.full((B0,), -float('inf'), dtype=tl.float32)
+    exp_sum = tl.full((B0,), 0.0, dtype=tl.float32)
+    z = tl.full((B0,), 0.0, dtype = tl.float32)
+
+    for i in range(T // B1 + 1):
+        # load k & v; compute qk
+        kv_off = tl.arange(0, B1)[None, :] + i * B1
+        k = tl.load(k_ptr + kv_off, kv_off < T)
+        v = tl.load(v_ptr + kv_off, kv_off < T)
+        qk = q * k
+
+        # compute new x_max, which is used to compute x_exp
+        new_x_max = tl.maximum(x_max, qk.max(1))
+        x_exp = myexp(qk - new_x_max[:, None])
+
+        # scale exp_sum so it uses the new x_max and add contribution from
+        new_exp_sum = exp_sum / myexp(new_x_max - x_max)
+        new_exp_sum = new_exp_sum + x_exp.sum(1)
+        soft = x_exp / new_exp_sum[:, None]
+
+        # scale z by the new exp_sum
+        alpha = new_exp_sum / exp_sum
+        z = z / alpha
+
+        # add contribution from v * soft
+        z = z + (v * soft).sum(1)
+
+        # update x_max and exp_sum with new values
+        x_max = new_x_max
+        exp_sum = new_exp_sum
+    tl.store(z_ptr + q_off, z[:, None], q_off < N0)
     return
 
 
@@ -501,8 +659,29 @@ def conv2d_kernel(
     x_ptr, k_ptr, z_ptr, N0, H, W, KH: tl.constexpr, KW: tl.constexpr, B0: tl.constexpr
 ):
     block_id_i = tl.program_id(0)
-    # Finish me!
+    # we don't actually need to pad since the mask can block extra elements to 0
+    x_off_B = tl.arange(0, B0)[:, None, None] * H * W + block_id_i * H * W
+    k_off_H = tl.arange(0, KH)[:, None] * KW
+    k_off_W = tl.arange(0, KW)[None, :]
+    k = tl.load(k_ptr + k_off_H + k_off_W)
+    for i in range(H):
+        x_off_H = tl.arange(0, KH)[None, :, None] * W + i * W
+        for j in range(W):
+            print(f"i: {i}, j: {j}")
+            x_off_W = tl.arange(0, KW)[None, None, :] + j
+            x_off = x_off_B + x_off_H + x_off_W
+            mask = (x_off_B < N0 * H * W) * (x_off_H < H * W) * (x_off_W < W)
+            x = tl.load(x_ptr + x_off, mask)
+            z = (x * k).sum(1).sum(1)
+            tl.store(z_ptr + x_off_B + i*W + j, z.reshape(1, 1, 1), (x_off_B < N0 * H * W))
     return
+
+    # this isn't actually very parallelized
+    # is there a faster way to do this that doesn't go one conv entry at a time?
+    # one minor improvement would be subtracting the stuff that's been removed
+    # from z and add the new stuff in as we move the kernel along
+    # if we used more program axes, say BH and BW, then we could iterate through BH and BW
+    # instead and parallelize a bunch more that way
 
 
 r"""
@@ -547,9 +726,43 @@ def dot_kernel(
     block_id_j = tl.program_id(0)
     block_id_k = tl.program_id(1)
     block_id_i = tl.program_id(2)
-    # Finish me!
+    # this matrix multiplication is N2 x N0 x MID by N2 x MID x N1 with an N2 x N0 x N1 output
+    # awkward that we can't use B for the batch dim here lol
+    # B0 tiles over N0, B1 tiles over N1, B2 tiles over N2, and we probably do a for loop over MID since we need to reduce over it anyway
+
+    x_off_B2 = tl.arange(0, B2)[:, None, None] * N0 * MID + block_id_i * B2 * N0 * MID
+    x_off_B0 = tl.arange(0, B0)[None, :, None] * MID + block_id_j * B0 * MID
+    
+    y_off_B2 = tl.arange(0, B2)[:, None, None] * MID * N1 + block_id_i * B2 * MID * N1
+    y_off_B1 = tl.arange(0, B1)[None, None, :] + block_id_k * B1
+
+    accum = tl.zeros((B2, B0, B1), tl.float32)
+    z_off_B2 = tl.arange(0, B2)[:, None, None] * N0 * N1 + block_id_i * B2 * N0 * N1
+    z_off_B0 = tl.arange(0, B0)[None, :, None] * N1 + block_id_j * B0 * N1
+    z_off_B1 = tl.arange(0, B1)[None, None, :] + block_id_k * B1
+
+    for mid_idx in range(MID // B_MID + 1):
+        x_off_MID = tl.arange(0, B_MID)[None, None, :] + mid_idx * B_MID
+        y_off_MID = tl.arange(0, B_MID)[None, :, None] * N1 + mid_idx * B_MID * N1
+
+        x_off = x_off_B2 + x_off_B0 + x_off_MID
+        x_mask = (x_off_B2 < N2 * N0 * MID) * (x_off_B0 < N0 * MID) * (x_off_MID < MID)
+        x = tl.load(x_ptr + x_off, x_mask) # B2 x B0 x B_MID
+
+        y_off = y_off_B2 + y_off_MID + y_off_B1
+        y_mask = (y_off_B2 < N2 * MID * N1) * (y_off_MID < MID * N1) * (y_off_B1 < N1)
+        y = tl.load(y_ptr + y_off, y_mask) # B2 x B_MID x B1
+
+        z = tl.dot(x, y) # B2 x B0 x B1
+        accum = accum + z
+    z_off = z_off_B2 + z_off_B0 + z_off_B1
+    z_mask = (z_off_B2 < N2 * N0 * N1) * (z_off_B0 < N0 * N1) * (z_off_B1 < N1)
+    tl.store(z_ptr + z_off, accum, z_mask)
+
     return
 
+# how performant is this gemm kernel? when I do a tl.load, is it all being loaded to shared memory?
+# if I have time later, maybe I'll compile it for my local RTX 4060 and figure out how to inspect the PTX for the compiled kernel
 
 r"""
 ## Puzzle 12: Quantized Matrix Mult
@@ -594,8 +807,16 @@ def quant_dot_spec(
     offset = (
         extract(offset)[..., None].expand(-1, 1, 8, GROUP).contiguous().view(-1, 64)
     )
+    print(scale * (extract(weight).view(-1, 64) - offset))
     return (scale * (extract(weight).view(-1, 64) - offset)) @ activation
 
+# tensor([[ 0.0150,  0.0187,  0.0487,  ...,  5.9467,  5.9467,  5.9467],
+#         [ 0.1775, -0.2662, -0.3106,  ...,  0.0000,  0.0000,  0.0000],
+#         [-0.5930, -0.7907, -1.1860,  ...,  0.0000,  0.0000,  0.0000],
+#         ...,
+#         [ 0.4369, -0.1873,  0.1873,  ...,  0.0000,  0.0000,  0.0000],
+#         [ 0.4953,  0.3302, -0.4953,  ..., -0.0000, -0.0000, -0.0000],
+#         [ 0.0138,  0.0000, -0.0069,  ..., -2.7738, -2.7738, -2.7738]])
 
 @triton.jit
 def quant_dot_kernel(
@@ -613,8 +834,55 @@ def quant_dot_kernel(
 ):
     block_id_j = tl.program_id(0)
     block_id_k = tl.program_id(1)
-    # Finish me!
+    weight_off_j = tl.arange(0, B0)[:, None] * MID // GROUP + block_id_j * B0 * MID // GROUP
+
+    offset_off = tl.arange(0, B0)[:, None, None] + block_id_j * B0
+    offset = tl.load(offset_ptr + offset_off, offset_off < N0)
+    offset_bit_shift = tl.arange(0, GROUP)[None, :, None] * 4
+    mask = 2**4 - 1
+    offset = (offset >> offset_bit_shift) & mask
+
+    activation_off_k = tl.arange(0, B1)[None, :] + block_id_k * B1
+
+    accum = tl.zeros((B0, B1), tl.float32)
+
+    for MID_idx in range(MID // B_MID + 1):
+        print(f"block_id_j: {block_id_j}, MID_idx: {MID_idx}, block_id_k: {block_id_k}")
+        weight_B_MID = B_MID // GROUP
+        weight_off_MID = tl.arange(0, weight_B_MID)[None, :] + MID_idx * weight_B_MID
+        activation_off_MID = tl.arange(0, B_MID)[:, None] * N1 + MID_idx * B_MID * N1
+
+        weight_off = weight_off_j + weight_off_MID
+        weight_mask = (weight_off_j < N0*MID//GROUP) * (weight_off_MID < MID//GROUP)
+        weight = tl.load(weight_ptr + weight_off, weight_mask)
+        weight = weight.reshape(B0, B_MID//GROUP, 1)
+        weight = weight 
+        weight_bit_shift = tl.arange(0, GROUP)[None, None, :] * 4
+        real_weights = (weight >> weight_bit_shift) & mask # B0, B_MID // GROUP, GROUP
+        real_weights = real_weights - offset
+        scale = tl.load(scale_ptr + weight_off, weight_mask)
+        real_weights = real_weights * scale.reshape(B0, B_MID//GROUP, 1)
+        real_weights = real_weights.reshape(B0, B_MID)
+
+        activation_off = activation_off_MID + activation_off_k
+        activation_mask = (activation_off_MID < MID * N1) * (activation_off_k < N1)
+        activation = tl.load(activation_ptr + activation_off, activation_mask)
+        activation_off = activation_off_MID + activation_off_k
+        activation_mask = (activation_off_MID < MID * N1) * (activation_off_k < N1)
+        activation = tl.load(activation_ptr + activation_off, activation_mask)
+
+        accum = accum + tl.dot(real_weights, activation)
+    z_off_j = tl.arange(0, B0)[:, None] * N1 + block_id_j * B0 * N1
+    z_off_k = tl.arange(0, B1) + block_id_k * B1
+    z_off = z_off_j + z_off_k
+    z_mask = (z_off_j < N0 * N1) * (z_off_k < N1)
+
+    tl.store(z_ptr + z_off, accum, z_mask)
     return
+
+# there's a weird conflation of indices here...
+# if the quantized weights are M x K in shape, I think the offset should be M x (K // GROUP)
+# it only makes sense to be 1D for this specific case where K is 8
 
 
 def run_demos():
